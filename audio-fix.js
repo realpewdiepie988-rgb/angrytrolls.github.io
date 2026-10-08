@@ -177,11 +177,13 @@
     if (result && result.catch) {
       result.catch(function () {
         /*
-         * Chrome may block playback when a sound is requested before the
-         * user's first gesture. The next actual game sound after a gesture
-         * will play normally.
+         * A sound may have been requested before the first user gesture.
+         * Keep this source queued so the gesture handler can start it.
          */
-      });
+        if (!userHasInteracted && pendingSources.indexOf(this) === -1) {
+          pendingSources.push(this);
+        }
+      }.bind(this));
     }
   };
 
@@ -222,22 +224,30 @@
    * elements, retry playback once after the gesture.
    */
   var userHasInteracted = false;
+  var pendingSources = [];
 
   function unlockAudio() {
-    var audios;
     var i;
     var result;
 
     userHasInteracted = true;
-    audios = document.getElementsByTagName('audio');
 
-    for (i = 0; i < audios.length; i++) {
+    /*
+     * Start any game sounds/music that tried to begin before Chrome allowed
+     * audio playback.
+     */
+    for (i = pendingSources.length - 1; i >= 0; i--) {
       try {
-        result = audios[i].play();
-        if (result && result.catch) {
-          result.catch(function () {});
+        if (pendingSources[i] && pendingSources[i]._audio) {
+          result = pendingSources[i]._audio.play();
+
+          if (result && result.catch) {
+            result.catch(function () {});
+          }
         }
       } catch (ignore) {}
+
+      pendingSources.splice(i, 1);
     }
   }
 
