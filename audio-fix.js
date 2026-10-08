@@ -1,14 +1,14 @@
 /*
  * Angry Birds Chrome - modern browser audio compatibility
  *
- * The original game requests audio from /fowl/audio/..., while this
- * restoration stores the audio files in /cors/fowl/audio/....
+ * The original game uses a very old Web Audio API implementation
+ * (createBufferSource/createGainNode/noteOn). Modern Chrome can reject
+ * the real AudioContext during page startup because it is not created
+ * from a user gesture.
  *
- * This file:
- *   1. Redirects same-origin audio XHR requests to the actual audio folder.
- *   2. Redirects HTML5 <audio> src assignments the same way.
- *   3. Tracks AudioContext instances and resumes them after a user gesture.
- *   4. Retries paused HTML5 audio after a user gesture.
+ * This compatibility layer keeps the game's old API shape but implements
+ * playback with HTML5 Audio instead. Audio files are also redirected from
+ * /fowl/audio/ to the restored /cors/fowl/audio/ directory.
  */
 
 (function () {
@@ -22,7 +22,6 @@
     try {
       var parsed = new URL(url, document.baseURI);
 
-      // Only redirect this site's own game audio.
       if (parsed.origin === window.location.origin) {
         parsed.pathname = parsed.pathname.replace(
           /\/fowl\/audio\//,
@@ -32,13 +31,14 @@
 
       return parsed.href;
     } catch (ignore) {
-      // Fall back to the original URL if it is not a normal URL string.
       return url;
     }
   }
 
-  // Angry Birds Chrome's Web Audio loader uses XMLHttpRequest with
-  // responseType = "arraybuffer" before calling decode/createBuffer.
+  /*
+   * The game's sound loader uses XMLHttpRequest + arraybuffer, then
+   * AudioContext.createBuffer(). Redirect only those audio requests.
+   */
   if (window.XMLHttpRequest && XMLHttpRequest.prototype.open) {
     var originalXhrOpen = XMLHttpRequest.prototype.open;
 
@@ -54,80 +54,186 @@
     };
   }
 
-  // The game can fall back to its HTML5 audio backend, which assigns
-  // an audio element's .src directly.
-  if (window.HTMLMediaElement) {
-    var mediaDescriptor = Object.getOwnPropertyDescriptor(
-      HTMLMediaElement.prototype,
-      'src'
-    );
+  /*
+   * Minimal compatibility implementation for the obsolete Web Audio API
+   * used by this particular build of Angry Birds Chrome.
+   *
+   * It intentionally does NOT construct a native AudioContext, so Chrome
+   * cannot reject it during page startup.
+   */
+  function AngryBirdsAudioContext() {
+    this.currentTime = 0;
+    this.destination = {};
+    this.state = 'running';
+  }
 
-    if (mediaDescriptor && mediaDescriptor.set && mediaDescriptor.get) {
-      Object.defineProperty(HTMLMediaElement.prototype, 'src', {
-        configurable: mediaDescriptor.configurable,
-        enumerable: mediaDescriptor.enumerable,
-        get: mediaDescriptor.get,
-        set: function (value) {
-          mediaDescriptor.set.call(this, fixAudioUrl(value));
-        }
+  AngryBirdsAudioContext.prototype.createBuffer = function (arrayBuffer) {
+    var blob;
+    var url;
+
+    if (!(arrayBuffer instanceof ArrayBuffer)) {
+      throw new TypeError('Angry Birds audio buffer must be an ArrayBuffer');
+    }
+
+    blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
+    url = URL.createObjectURL(blob);
+
+    return {
+      _url: url,
+      duration: 0
+    };
+  };
+
+  AngryBirdsAudioContext.prototype.createBufferSource = function () {
+    return new AngryBirdsBufferSource(this);
+  };
+
+  AngryBirdsAudioContext.prototype.createGainNode = function () {
+    return new AngryBirdsGainNode();
+  };
+
+  AngryBirdsAudioContext.prototype.createGain = function () {
+    return this.createGainNode();
+  };
+
+  AngryBirdsAudioContext.prototype.resume = function () {
+    this.state = 'running';
+    return Promise.resolve();
+  };
+
+  AngryBirdsAudioContext.prototype.suspend = function () {
+    this.state = 'suspended';
+    return Promise.resolve();
+  };
+
+  AngryBirdsAudioContext.prototype.close = function () {
+    this.state = 'closed';
+    return Promise.resolve();
+  };
+
+  function AngryBirdsGainNode() {
+    this.gain = {
+      value: 1
+    };
+    this._volume = 1;
+    this.destination = null;
+  }
+
+  AngryBirdsGainNode.prototype.connect = function (destination) {
+    this.destination = destination;
+    return destination;
+  };
+
+  AngryBirdsGainNode.prototype.disconnect = function () {};
+
+  function AngryBirdsBufferSource(context) {
+    this.context = context;
+    this.buffer = null;
+    this.loop = false;
+    this._audio = null;
+    this._gain = 1;
+  }
+
+  AngryBirdsBufferSource.prototype.connect = function (node) {
+    if (node && node.gain && typeof node.gain.value === 'number') {
+      this._gain = node.gain.value;
+    }
+
+    return node;
+  };
+
+  AngryBirdsBufferSource.prototype.disconnect = function () {};
+
+  AngryBirdsBufferSource.prototype._play = function (when) {
+    var audio;
+    var result;
+
+    if (!this.buffer || !this.buffer._url) {
+      return;
+    }
+
+    if (this._audio) {
+      try {
+        this._audio.pause();
+      } catch (ignore) {}
+    }
+
+    audio = new Audio();
+    audio.preload = 'auto';
+    audio.src = this.buffer._url;
+    audio.loop = !!this.loop;
+    audio.volume = Math.max(0, Math.min(1, this._gain));
+    this._audio = audio;
+
+    audio.addEventListener('loadedmetadata', function () {
+      if (isFinite(audio.duration) && audio.duration > 0) {
+        // Keep the emulated AudioBuffer duration useful to the old game.
+        this.buffer.duration = audio.duration;
+      }
+    }.bind(this), { once: true });
+
+    result = audio.play();
+
+    if (result && result.catch) {
+      result.catch(function () {
+        /*
+         * Chrome may block playback when a sound is requested before the
+         * user's first gesture. The next actual game sound after a gesture
+         * will play normally.
+         */
       });
     }
-  }
+  };
 
-  // Chrome may leave Web Audio contexts suspended until the page receives
-  // a user gesture. Track contexts created by the old game.
-  var NativeAudioContext =
-    window.AudioContext || window.webkitAudioContext;
-  var audioContexts = [];
+  /*
+   * The original build calls noteOn(). Newer code sometimes calls start().
+   */
+  AngryBirdsBufferSource.prototype.noteOn = function (when) {
+    this._play(when || 0);
+  };
 
-  if (NativeAudioContext) {
-    var TrackedAudioContext = function () {
-      var context = new NativeAudioContext();
-      audioContexts.push(context);
-      return context;
-    };
+  AngryBirdsBufferSource.prototype.start = function (when) {
+    this._play(when || 0);
+  };
 
-    TrackedAudioContext.prototype = NativeAudioContext.prototype;
+  AngryBirdsBufferSource.prototype.noteOff = function () {
+    this.stop();
+  };
 
-    try {
-      window.AudioContext = TrackedAudioContext;
-    } catch (ignore) {}
+  AngryBirdsBufferSource.prototype.stop = function () {
+    if (this._audio) {
+      try {
+        this._audio.pause();
+        this._audio.currentTime = 0;
+      } catch (ignore) {}
+      this._audio = null;
+    }
+  };
 
-    try {
-      window.webkitAudioContext = TrackedAudioContext;
-    } catch (ignore) {}
-  }
+  /*
+   * Replace the real constructors only for this page/game. The rest of the
+   * site does not need a native AudioContext.
+   */
+  window.AudioContext = AngryBirdsAudioContext;
+  window.webkitAudioContext = AngryBirdsAudioContext;
+
+  /*
+   * Mark the page as interacted with. For already-created HTML5 audio
+   * elements, retry playback once after the gesture.
+   */
+  var userHasInteracted = false;
 
   function unlockAudio() {
-    var i;
-    var context;
-    var result;
     var audios;
-    var j;
+    var i;
+    var result;
 
-    for (i = 0; i < audioContexts.length; i++) {
-      context = audioContexts[i];
-
-      if (context && context.state === 'suspended' && context.resume) {
-        try {
-          result = context.resume();
-          if (result && result.catch) {
-            result.catch(function () {});
-          }
-        } catch (ignore) {}
-      }
-    }
-
-    // Also retry any HTML5 audio elements whose initial play() was blocked.
+    userHasInteracted = true;
     audios = document.getElementsByTagName('audio');
 
-    for (j = 0; j < audios.length; j++) {
-      if (!audios[j].paused) {
-        continue;
-      }
-
+    for (i = 0; i < audios.length; i++) {
       try {
-        result = audios[j].play();
+        result = audios[i].play();
         if (result && result.catch) {
           result.catch(function () {});
         }
@@ -138,4 +244,8 @@
   ['pointerdown', 'mousedown', 'keydown', 'touchstart'].forEach(function (eventName) {
     document.addEventListener(eventName, unlockAudio, false);
   });
+
+  window.angryBirdsAudioHasUserGesture = function () {
+    return userHasInteracted;
+  };
 })();
