@@ -20,11 +20,12 @@
     <link rel="stylesheet" href="css/angry_birds_chrome.css" type="text/css">
     <link rel="chrome-webstore-item" href="https://chrome.google.com/webstore/detail/aknpkdffaafgjchaibgeefbgmgeghloj">
  <link rel="shortcut icon" type="image/x-icon" href="favicon.ico">
-   <script>
+   
+    <script>
 (function () {
   var Ctx = window.AudioContext || window.webkitAudioContext;
   if (!Ctx) return;
-  var made = [];
+  var made = window.__ctxs = [];
   function Patched() { var c = new Ctx(...arguments); made.push(c); return c; }
   Patched.prototype = Ctx.prototype;
   window.AudioContext = Patched;
