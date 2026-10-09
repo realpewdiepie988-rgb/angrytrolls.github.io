@@ -20,7 +20,21 @@
     <link rel="stylesheet" href="css/angry_birds_chrome.css" type="text/css">
     <link rel="chrome-webstore-item" href="https://chrome.google.com/webstore/detail/aknpkdffaafgjchaibgeefbgmgeghloj">
  <link rel="shortcut icon" type="image/x-icon" href="favicon.ico">
-    
+   <script>
+(function () {
+  var Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  var made = [];
+  function Patched() { var c = new Ctx(...arguments); made.push(c); return c; }
+  Patched.prototype = Ctx.prototype;
+  window.AudioContext = Patched;
+  window.webkitAudioContext = Patched;
+  function resume() { made.forEach(function (c) { if (c.state === 'suspended') c.resume(); }); }
+  ['mousedown', 'click', 'keydown', 'touchstart'].forEach(function (e) {
+    document.addEventListener(e, resume, true);
+  });
+})();
+</script>
 
     <script type="text/javascript">
       var _gaq = _gaq || [];
